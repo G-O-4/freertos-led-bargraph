@@ -26,8 +26,8 @@ const int sensorPin = 23;
 
 // Modes
 PowerMode powerMode = normalMode;
-SensorMode sensorMode = humidityMode; 
-ScaleMode scaleMode = thresholdMode;
+SensorMode sensorMode = temperatureMode; 
+ScaleMode scaleMode = absoluteMode;
 
 // Global Vars
 QueueHandle_t sensorQueue;
@@ -114,6 +114,10 @@ void vLedView(void *pvParameters){
     xQueueReceive(potQueue, &recievedPot, portMAX_DELAY);
     xQueueReceive(sensorQueue, &recievedSensor, portMAX_DELAY);
     iteratorVal = recievedPot - 2 * STEP_SIZE;    
+
+    Serial.println(recievedPot);
+    Serial.println(recievedSensor);
+    Serial.println("---------------------");
 
     switch (scaleMode) {
     case  absoluteMode:
