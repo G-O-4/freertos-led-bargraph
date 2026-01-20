@@ -1,147 +1,260 @@
 #include <Arduino.h>
 #include <freertos/FreeRTOS.h>
-#include <freertos/queue.h>
 #include <freertos/task.h>
+#include <freertos/queue.h>
 #include "DHT.h"
+#include "esp_sleep.h"
 
-#define HIGH_PRIORETY 2
-#define MED_PRIORETY 1
-#define LOW_PRIORETY 0
+// ---------- Your constants ----------
+#define LED_DELAY    1000
+#define SENSOR_DELAY 2000   // DHT22 needs ~2s between reads to reduce NaN
+#define POT_DELAY    100
+#define STEP_SIZE    3
 
-#define LED_DELAY 1000
-#define SENSOR_DELAY 500
-#define POT_DELAY 100
+// ---------- Modes ----------
+enum PowerMode  { normalMode, lowEnergyMode };
+enum SensorMode { temperatureMode, humidityMode };
+enum ScaleMode  { thresholdMode, absoluteMode };
 
-#define STEP_SIZE 3
-
-// Helper enums for modes, they help the readablity of the program
-enum PowerMode {normalMode, lowEnergyMode};
-enum SensorMode {temperatureMode, humidityMode};
-enum ScaleMode {thresholdMode, absoluteMode};
-
-// Pins
+// ---------- Your pins (UNCHANGED) ----------
 const int ledPins[5] = {33, 25, 26, 27, 14};
 const int potPin = 34;
 const int sensorPin = 23;
 
-// Modes
-PowerMode powerMode = normalMode;
-SensorMode sensorMode = temperatureMode; 
-ScaleMode scaleMode = absoluteMode;
+// ---------- Buttons pins (AS YOU REQUESTED) ----------
+const int btnSensorPin = 0;  // TEMP/HUM
+const int btnScalePin  = 4;  // THR/ABS
+const int btnPowerPin  = 15; // NORMAL/LOW ENERGY
 
-// Global Vars
-QueueHandle_t sensorQueue;
-QueueHandle_t potQueue;
+// ---------- Globals ----------
+PowerMode  powerMode  = normalMode;
+SensorMode sensorMode = temperatureMode;
+ScaleMode  scaleMode  = absoluteMode;
 
-// Functions
-void vSensorRead(void *pvParameters);
-void vPotRead(void *pvParameters);
-void vLedView(void *pvParamters);
 DHT dht(sensorPin, DHT22);
 
-void setup() {
-  // Putting leds to output
-  for (int led: ledPins){
-    pinMode(led, OUTPUT);
-  }
+// ---- Send BOTH readings so serial can show temp + hum always ----
+struct SensorData {
+  float tempC;
+  float humPct;
+  bool  tempOK;
+  bool  humOK;
+};
 
-  // Setting Sensor and Pot
-  pinMode(potPin, INPUT);
-  pinMode(sensorPin, INPUT);
+QueueHandle_t sensorQueue;
+QueueHandle_t potQueue; // mapped threshold only (int), no raw ADC now
 
-  // Init Serial
-  Serial.begin(115200);
+// ---- Button notification bits ----
+static const uint32_t BTN_SENSOR_BIT = (1u << 0);
+static const uint32_t BTN_SCALE_BIT  = (1u << 1);
+static const uint32_t BTN_POWER_BIT  = (1u << 2);
 
-  // Init dht
-  dht.begin();
+TaskHandle_t buttonTaskHandle = nullptr;
 
-  // Queues
-  sensorQueue = xQueueCreate(1, sizeof(float));
-  potQueue = xQueueCreate(1, sizeof(int));
-
-  // Create Tasks
-  xTaskCreate(vSensorRead, "Sensor", 2048, nullptr, MED_PRIORETY, nullptr);
-  xTaskCreate(vPotRead, "Potentiometer", 2048, nullptr, LOW_PRIORETY, nullptr);
-  xTaskCreate(vLedView, "Led Output", 2048, nullptr, HIGH_PRIORETY, nullptr);
-}
-
-void loop(){
-  // Empty
-} 
-
-void vSensorRead(void *pvParameters){
-  float t, h;
-
-  while (true){
-    switch (sensorMode) {
-    case temperatureMode:
-      t = dht.readTemperature();
-      xQueueOverwrite(sensorQueue, &t);
-      break;
-    
-    case humidityMode:
-      h = dht.readHumidity();
-      xQueueOverwrite(sensorQueue, &h);
-      break;
-
-    default:
-      break;
-    }
-  vTaskDelay(pdMS_TO_TICKS(SENSOR_DELAY));
+// ---------- Helpers ----------
+void setLedBar(uint8_t level) { // 0..5
+  if (level > 5) level = 5;
+  for (int i = 0; i < 5; i++) {
+    digitalWrite(ledPins[i], (i < level) ? HIGH : LOW);
   }
 }
 
+void enterLightSleep10s() {
+  esp_sleep_enable_timer_wakeup(10ULL * 1000000ULL);
+  Serial.flush();
+  esp_light_sleep_start();
+}
 
-void vPotRead(void *pvParameters){
-  int potVal;
+static void printStatus(const SensorData &sd, int threshold, float usedVal) {
+  Serial.println("========================================");
+  Serial.println(" Smart Environment Monitor (ESP32)");
+  Serial.println("----------------------------------------");
 
-  while (true){
-    potVal = analogRead(potPin);
-    potVal = (sensorMode == temperatureMode)? map(potVal, 0, 4095, 19, 26) : map(potVal, 0, 4095, 35, 66);
-    xQueueOverwrite(potQueue, &potVal);
+  Serial.print("Temperature (C): ");
+  if (sd.tempOK) Serial.println(sd.tempC, 1);
+  else Serial.println("N/A");
+
+  Serial.print("Humidity    (%): ");
+  if (sd.humOK) Serial.println(sd.humPct, 1);
+  else Serial.println("N/A");
+
+  Serial.print("Pot threshold: ");
+  Serial.println(threshold);
+
+  Serial.print("BTN1 Sensor mode: ");
+  Serial.println((sensorMode == temperatureMode) ? "TEMPERATURE" : "HUMIDITY");
+
+  Serial.print("BTN2 Scale mode : ");
+  Serial.println((scaleMode == absoluteMode) ? "ABSOLUTE" : "THRESHOLD");
+
+  Serial.print("BTN3 Power mode : ");
+  Serial.println((powerMode == normalMode) ? "NORMAL" : "LOW ENERGY");
+
+  Serial.print("Value used for LEDs: ");
+  if (!isnan(usedVal)) Serial.println(usedVal, 1);
+  else Serial.println("N/A");
+
+  Serial.println("========================================");
+}
+
+// ---------- ISRs ----------
+void IRAM_ATTR isrSensor() {
+  BaseType_t hp = pdFALSE;
+  xTaskNotifyFromISR(buttonTaskHandle, BTN_SENSOR_BIT, eSetBits, &hp);
+  if (hp) portYIELD_FROM_ISR();
+}
+void IRAM_ATTR isrScale() {
+  BaseType_t hp = pdFALSE;
+  xTaskNotifyFromISR(buttonTaskHandle, BTN_SCALE_BIT, eSetBits, &hp);
+  if (hp) portYIELD_FROM_ISR();
+}
+void IRAM_ATTR isrPower() {
+  BaseType_t hp = pdFALSE;
+  xTaskNotifyFromISR(buttonTaskHandle, BTN_POWER_BIT, eSetBits, &hp);
+  if (hp) portYIELD_FROM_ISR();
+}
+
+// ---------- Tasks ----------
+void vSensorRead(void *pv) {
+  static SensorData sd = {NAN, NAN, false, false};
+
+  while (true) {
+    float t = dht.readTemperature();
+    float h = dht.readHumidity();
+
+    // NaN prevention: only update if valid
+    if (!isnan(t)) { sd.tempC = t; sd.tempOK = true; }
+    if (!isnan(h)) { sd.humPct = h; sd.humOK  = true; }
+
+    xQueueOverwrite(sensorQueue, &sd);
+    vTaskDelay(pdMS_TO_TICKS(SENSOR_DELAY));
+  }
+}
+
+void vPotRead(void *pv) {
+  int thr;
+
+  while (true) {
+    int raw = analogRead(potPin);
+
+    // Your exact ranges (UNCHANGED):
+    thr = (sensorMode == temperatureMode)
+            ? map(raw, 0, 4095, 19, 26)
+            : map(raw, 0, 4095, 35, 66);
+
+    xQueueOverwrite(potQueue, &thr);
     vTaskDelay(pdMS_TO_TICKS(POT_DELAY));
   }
 }
 
+void vLedView(void *pv) {
+  SensorData sd;
+  int threshold = 0;
 
-void vLedView(void *pvParameters){
-  float recievedSensor;
-  int recievedPot, iteratorVal;
-  int factorHT = (sensorMode == temperatureMode)? 1 : 2;
-  int comparisonMap[4] = {-5*factorHT, -factorHT, factorHT, 5*factorHT};
+  // Wait for first values (prevents startup junk)
+  xQueueReceive(sensorQueue, &sd, portMAX_DELAY);
+  xQueueReceive(potQueue, &threshold, portMAX_DELAY);
 
-  while (true){
-    xQueueReceive(potQueue, &recievedPot, portMAX_DELAY);
-    xQueueReceive(sensorQueue, &recievedSensor, portMAX_DELAY);
-    iteratorVal = recievedPot - 2 * STEP_SIZE;    
+  while (true) {
+    // Get latest values without removing them
+    xQueuePeek(sensorQueue, &sd, 0);
+    xQueuePeek(potQueue, &threshold, 0);
 
-    Serial.println(recievedPot);
-    Serial.println(recievedSensor);
-    Serial.println("---------------------");
+    // Choose which sensor value to use
+    float sensorVal = (sensorMode == temperatureMode) ? sd.tempC : sd.humPct;
+    bool  ok        = (sensorMode == temperatureMode) ? sd.tempOK : sd.humOK;
 
-    switch (scaleMode) {
-    case  absoluteMode:
-      for (int led: ledPins){
-        if (iteratorVal <= recievedSensor) {
-          digitalWrite(led, HIGH);
-          iteratorVal += STEP_SIZE;
+    // -------- LED update FIRST (prevents visible blink while printing) --------
+    uint8_t ledLevel = 0;
+
+    if (!ok || isnan(sensorVal)) {
+      ledLevel = 0;
+    } else {
+      int factorHT = (sensorMode == temperatureMode) ? 1 : 2;
+
+      if (scaleMode == absoluteMode) {
+        float level = threshold - 2 * STEP_SIZE;
+        ledLevel = 0;
+        for (int i = 0; i < 5; i++) {
+          if (sensorVal >= level) {
+            ledLevel++;
+            level += STEP_SIZE;
+          } else break;
         }
-        else
-          break;
-      }
-      break;
-    
-    case thresholdMode:
-      for (int i=0; i<4; i++){
-        digitalWrite(ledPins[i], HIGH);
-        if (comparisonMap[i] + recievedPot > recievedSensor)
-          break;
-      }
+      } else { // thresholdMode
+        float thr = (float)threshold;
+        float v = sensorVal;
 
-    default:
-      break;
+        if (v < thr - 5 * factorHT)      ledLevel = 1;
+        else if (v < thr - 1 * factorHT) ledLevel = 2;
+        else if (v < thr + 1 * factorHT) ledLevel = 3;
+        else if (v < thr + 5 * factorHT) ledLevel = 4;
+        else                             ledLevel = 5;
+      }
     }
 
-    vTaskDelay(pdMS_TO_TICKS(LED_DELAY));
+    // Set LEDs in one consistent step (no clearing-then-printing blink)
+    setLedBar(ledLevel);
+
+    // -------- Serial print AFTER LED update --------
+    printStatus(sd, threshold, (ok ? sensorVal : NAN));
+
+    if (powerMode == lowEnergyMode) enterLightSleep10s();
+    else vTaskDelay(pdMS_TO_TICKS(LED_DELAY));
   }
 }
+
+// Debounce + apply button actions
+void vButtons(void *pv) {
+  uint32_t bits;
+  TickType_t lastSensor = 0, lastScale = 0, lastPower = 0;
+  const TickType_t debounce = pdMS_TO_TICKS(50);
+
+  while (true) {
+    xTaskNotifyWait(0, 0xFFFFFFFF, &bits, portMAX_DELAY);
+    TickType_t now = xTaskGetTickCount();
+
+    if ((bits & BTN_SENSOR_BIT) && (now - lastSensor > debounce)) {
+      lastSensor = now;
+      sensorMode = (sensorMode == temperatureMode) ? humidityMode : temperatureMode;
+    }
+    if ((bits & BTN_SCALE_BIT) && (now - lastScale > debounce)) {
+      lastScale = now;
+      scaleMode = (scaleMode == absoluteMode) ? thresholdMode : absoluteMode;
+    }
+    if ((bits & BTN_POWER_BIT) && (now - lastPower > debounce)) {
+      lastPower = now;
+      powerMode = (powerMode == normalMode) ? lowEnergyMode : normalMode;
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  for (int i = 0; i < 5; i++) pinMode(ledPins[i], OUTPUT);
+  pinMode(potPin, INPUT);
+  pinMode(sensorPin, INPUT);
+
+  // Buttons: internal pullup, press = LOW
+  pinMode(btnSensorPin, INPUT_PULLUP);
+  pinMode(btnScalePin,  INPUT_PULLUP);
+  pinMode(btnPowerPin,  INPUT_PULLUP);
+
+  dht.begin();
+
+  sensorQueue = xQueueCreate(1, sizeof(SensorData));
+  potQueue    = xQueueCreate(1, sizeof(int));
+
+  xTaskCreate(vSensorRead, "Sensor", 2048, nullptr, 2, nullptr);
+  xTaskCreate(vPotRead,    "Pot",    2048, nullptr, 1, nullptr);
+  xTaskCreate(vLedView,    "LED",    2048, nullptr, 2, nullptr);
+
+  xTaskCreate(vButtons, "Buttons", 2048, nullptr, 3, &buttonTaskHandle);
+
+  attachInterrupt(digitalPinToInterrupt(btnSensorPin), isrSensor, FALLING);
+  attachInterrupt(digitalPinToInterrupt(btnScalePin),  isrScale,  FALLING);
+  attachInterrupt(digitalPinToInterrupt(btnPowerPin),  isrPower,  FALLING);
+}
+
+void loop() {}
